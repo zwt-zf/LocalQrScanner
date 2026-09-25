@@ -1,0 +1,165 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的标签，例如 v0.1.1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Validate release version
+        id: metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $manifestPath = "Community.PowerToys.Run.Plugin.LocalQrScanner/plugin.json"
+          $projectPath = "Community.PowerToys.Run.Plugin.LocalQrScanner/Community.PowerToys.Run.Plugin.LocalQrScanner.csproj"
+          $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+          [xml]$project = Get-Content -Raw -LiteralPath $projectPath
+          $version = [string]$manifest.Version
+          $projectVersion = [string]$project.Project.PropertyGroup.Version
+          $expectedTag = "v$version"
+
+          if ($env:RELEASE_TAG -ne $expectedTag) {
+              throw "Release tag '$env:RELEASE_TAG' must match plugin version '$expectedTag'."
+          }
+
+          if ($projectVersion -ne $version) {
+              throw "Project version '$projectVersion' does not match plugin.json version '$version'."
+          }
+
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Test
+        shell: pwsh
+        run: dotnet test ./LocalQrScanner.slnx -c Release -p:Platform=x64
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress --limit-output
+
+      - name: Build release packages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          ./scripts/pack.ps1 -Platform x64
+          ./scripts/pack.ps1 -Platform ARM64
+          ./scripts/build-installer.ps1
+
+      - name: Generate and verify checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ steps.metadata.outputs.version }}"
+          $files = @(
+              "artifacts/LocalQrScanner-$version-ARM64.zip",
+              "artifacts/LocalQrScanner-$version-x64.zip",
+              "artifacts/LocalQrScanner-Setup-$version-x64.exe"
+          )
+
+          foreach ($file in $files) {
+              if (-not (Test-Path -LiteralPath $file)) {
+                  throw "Expected release artifact is missing: $file"
+              }
+          }
+
+          $lines = foreach ($file in $files) {
+              $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+              "$hash *$([System.IO.Path]::GetFileName($file))"
+          }
+          [System.IO.File]::WriteAllLines(
+              (Join-Path $PWD "artifacts/SHA256SUMS.txt"),
+              $lines,
+              [System.Text.ASCIIEncoding]::new())
+
+          foreach ($line in Get-Content -LiteralPath "artifacts/SHA256SUMS.txt") {
+              if ($line -notmatch "^([0-9A-F]{64}) \*(.+)$") {
+                  throw "Invalid checksum line: $line"
+              }
+
+              $actual = (Get-FileHash -LiteralPath (Join-Path "artifacts" $Matches[2]) -Algorithm SHA256).Hash
+              if ($actual -ne $Matches[1]) {
+                  throw "Checksum verification failed for $($Matches[2])."
+              }
+          }
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: LocalQrScanner-${{ steps.metadata.outputs.version }}
+          if-no-files-found: error
+          path: |
+            artifacts/LocalQrScanner-${{ steps.metadata.outputs.version }}-x64.zip
+            artifacts/LocalQrScanner-${{ steps.metadata.outputs.version }}-ARM64.zip
+            artifacts/LocalQrScanner-Setup-${{ steps.metadata.outputs.version }}-x64.exe
+            artifacts/SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ steps.metadata.outputs.version }}"
+          $tag = $env:RELEASE_TAG
+          $assets = @(
+              "artifacts/LocalQrScanner-$version-x64.zip",
+              "artifacts/LocalQrScanner-$version-ARM64.zip",
+              "artifacts/LocalQrScanner-Setup-$version-x64.exe",
+              "artifacts/SHA256SUMS.txt"
+          )
+
+          & gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          $releaseExists = $LASTEXITCODE -eq 0
+
+          if ($releaseExists) {
+              & gh release upload $tag @assets --clobber --repo $env:GITHUB_REPOSITORY
+          }
+          else {
+              $arguments = @(
+                  "release", "create", $tag,
+                  "--repo", $env:GITHUB_REPOSITORY,
+                  "--title", "Local QR Scanner $version",
+                  "--generate-notes"
+              )
+              if ($version.Contains("-")) {
+                  $arguments += "--prerelease"
+              }
+
+              $arguments += $assets
+              & gh @arguments
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "GitHub Release publishing failed with exit code $LASTEXITCODE."
+          }
