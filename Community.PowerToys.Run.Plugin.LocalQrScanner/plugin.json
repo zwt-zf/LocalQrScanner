@@ -1,0 +1,14 @@
+{
+  "ID": "788600460E974239A2DB0FAD861029B0",
+  "ActionKeyword": "qr",
+  "IsGlobal": false,
+  "Name": "Local QR Scanner",
+  "Author": "LocalQrScanner Contributors",
+  "Version": "0.1.1",
+  "Language": "csharp",
+  "Website": "https://github.com/zwt-zf/LocalQrScanner",
+  "ExecuteFileName": "Community.PowerToys.Run.Plugin.LocalQrScanner.dll",
+  "IcoPathDark": "Images\\localqrscanner.dark.png",
+  "IcoPathLight": "Images\\localqrscanner.light.png",
+  "DynamicLoading": false
+}
